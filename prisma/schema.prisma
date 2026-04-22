@@ -1,0 +1,54 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Crime {
+  id                String   @id @default(cuid())
+  latitude          Float
+  longitude         Float
+  city              String
+  state             String
+  crimeType         String
+  crimeAgainstWomen Boolean  @default(false)
+  year              Int
+  month             Int?
+  count             Int      @default(1)
+  source            String
+  createdAt         DateTime @default(now())
+
+  @@index([latitude, longitude])
+  @@index([city, state])
+  @@index([crimeAgainstWomen])
+  @@map("crimes")
+}
+
+model Report {
+  id           String   @id @default(cuid())
+  latitude     Float
+  longitude    Float
+  address      String?
+  incidentType String
+  description  String
+  anonymous    Boolean  @default(false)
+  upvotes      Int      @default(0)
+  verified     Boolean  @default(false)
+  reportedAt   DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([latitude, longitude])
+  @@map("reports")
+}
+
+model SafetyCache {
+  geohash    String   @id
+  score      Float
+  breakdown  Json
+  aiSummary  String?
+  computedAt DateTime @default(now())
+
+  @@map("safety_cache")
+}
