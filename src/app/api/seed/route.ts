@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { prisma } from '@/lib/prisma'
+import { createServerClient } from '@/lib/supabase-server'
 import { NCRB_SEED } from '@/lib/ncrb-seed-data'
 
 // POST /api/seed — one-time DB seed (protect with secret)
@@ -9,22 +9,24 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  await prisma.crime.deleteMany({ where: { source: 'ncrb' } })
+  const supabase = createServerClient()
+  await supabase.from('crimes').delete().eq('source', 'ncrb')
 
-  const created = await prisma.crime.createMany({
-    data: NCRB_SEED.map(r => ({
+  const { error } = await supabase.from('crimes').insert(
+    NCRB_SEED.map(r => ({
       latitude: r.lat,
       longitude: r.lng,
       city: r.city,
       state: r.state,
-      crimeType: r.crimeType,
-      crimeAgainstWomen: r.crimeAgainstWomen,
+      crime_type: r.crimeType,
+      crime_against_women: r.crimeAgainstWomen,
       year: r.year,
       count: r.count,
       source: 'ncrb',
-    })),
-    skipDuplicates: true,
-  })
+    }))
+  )
+  const count = NCRB_SEED.length
 
-  return NextResponse.json({ seeded: created.count })
+  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  return NextResponse.json({ seeded: count })
 }

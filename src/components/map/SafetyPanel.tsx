@@ -2,7 +2,8 @@
 
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
-import { Shield, AlertTriangle, X, Users, FileText, TrendingUp } from 'lucide-react'
+import { Shield, AlertTriangle, X, Users, FileText, TrendingUp, TrendingDown, Minus } from 'lucide-react'
+import type { TrendData } from '@/lib/safety-score'
 
 interface SafetyData {
   score: number
@@ -14,6 +15,7 @@ interface SafetyData {
   crowdReports: number
   topCrimeTypes: string[]
   aiSummary: string | null
+  trend?: TrendData
 }
 
 interface Props {
@@ -24,17 +26,67 @@ interface Props {
 }
 
 const levelConfig = {
-  safe: { bg: 'bg-green-500/20', border: 'border-green-500/40', text: 'text-green-400', icon: Shield },
+  safe:     { bg: 'bg-green-500/20',  border: 'border-green-500/40',  text: 'text-green-400',  icon: Shield },
   moderate: { bg: 'bg-yellow-500/20', border: 'border-yellow-500/40', text: 'text-yellow-400', icon: AlertTriangle },
-  unsafe: { bg: 'bg-red-500/20', border: 'border-red-500/40', text: 'text-red-400', icon: AlertTriangle },
+  unsafe:   { bg: 'bg-red-500/20',    border: 'border-red-500/40',    text: 'text-red-400',    icon: AlertTriangle },
+}
+
+function TrendIndicator({ trend }: { trend: TrendData }) {
+  const { direction, percentChange, yearlyScores, sparkline } = trend
+  const years = Object.keys(yearlyScores).map(Number).sort()
+
+  const cfg = {
+    improving: { icon: TrendingUp,   color: 'text-green-400',  bg: 'bg-green-500/10',  border: 'border-green-500/20',  label: 'Improving' },
+    worsening: { icon: TrendingDown, color: 'text-red-400',    bg: 'bg-red-500/10',    border: 'border-red-500/20',    label: 'Worsening' },
+    stable:    { icon: Minus,        color: 'text-yellow-400', bg: 'bg-yellow-500/10', border: 'border-yellow-500/20', label: 'Stable' },
+  }[direction]
+
+  const Icon = cfg.icon
+
+  return (
+    <div className={`${cfg.bg} ${cfg.border} border rounded-xl p-3`}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-1.5">
+          <Icon size={13} className={cfg.color} />
+          <span className={`text-xs font-semibold ${cfg.color}`}>{cfg.label}</span>
+        </div>
+        <span className={`text-xs ${cfg.color}`}>
+          {percentChange > 0 ? '+' : ''}{percentChange}% vs last year
+        </span>
+      </div>
+
+      {/* Sparkline: normalised bar chart over 5 years */}
+      <div className="flex items-end gap-1 h-8">
+        {years.map((y, i) => {
+          const height = Math.max(8, sparkline[i] * 32)
+          const score  = yearlyScores[y]
+          const barColor = score >= 6.5 ? '#22c55e' : score >= 3.5 ? '#f59e0b' : '#ef4444'
+          const isLatest = i === years.length - 1
+          return (
+            <div key={y} className="flex flex-col items-center gap-0.5 flex-1">
+              <div
+                className="w-full rounded-sm transition-all"
+                style={{ height, backgroundColor: barColor, opacity: isLatest ? 1 : 0.5 }}
+                title={`${y}: ${score}/10`}
+              />
+              <span className="text-white/30 text-[9px]">{String(y).slice(2)}</span>
+            </div>
+          )
+        })}
+      </div>
+      <div className="text-white/30 text-[10px] mt-1">
+        Safety score trend 2018–2022 · brighter bar = most recent
+      </div>
+    </div>
+  )
 }
 
 export function SafetyPanel({ data, loading, open, onClose }: Props) {
   if (!open) return null
 
   return (
-    <div className="absolute bottom-0 left-0 right-0 md:bottom-8 md:left-4 md:right-auto md:w-96 z-20 animate-in slide-in-from-bottom duration-300">
-      <div className="bg-gray-900/95 backdrop-blur border border-white/10 rounded-t-2xl md:rounded-2xl p-5 text-white shadow-2xl">
+    <div className="absolute bottom-0 left-0 right-0 md:bottom-40 md:left-4 md:right-auto md:w-96 z-20 animate-in slide-in-from-bottom duration-300">
+      <div className="bg-gray-900/95 backdrop-blur border border-white/10 rounded-t-2xl md:rounded-2xl p-5 text-white shadow-2xl max-h-[85vh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-base font-semibold text-white/90">Safety Analysis</h2>
@@ -87,9 +139,9 @@ export function SafetyPanel({ data, loading, open, onClose }: Props) {
 
               {/* Stats */}
               <div className="grid grid-cols-3 gap-2 mb-4">
-                <StatCard icon={FileText} label="Total Crimes" value={data.totalCrimes.toLocaleString()} />
-                <StatCard icon={Users} label="vs Women" value={data.womenCrimes.toLocaleString()} highlight />
-                <StatCard icon={TrendingUp} label="Reports" value={data.crowdReports.toString()} />
+                <StatCard icon={FileText}    label="Total Crimes"  value={data.totalCrimes.toLocaleString()} />
+                <StatCard icon={Users}       label="vs Women"      value={data.womenCrimes.toLocaleString()} highlight />
+                <StatCard icon={TrendingUp}  label="Reports"       value={data.crowdReports.toString()} />
               </div>
 
               {/* Top crime types */}
@@ -106,6 +158,17 @@ export function SafetyPanel({ data, loading, open, onClose }: Props) {
                 </div>
               )}
 
+              {/* Trend analysis */}
+              {data.trend && Object.keys(data.trend.yearlyScores).length >= 2 && (
+                <>
+                  <Separator className="bg-white/10 mb-4" />
+                  <div className="mb-4">
+                    <div className="text-white/50 text-xs font-medium mb-2">Crime Trend (2018–2022)</div>
+                    <TrendIndicator trend={data.trend} />
+                  </div>
+                </>
+              )}
+
               {/* AI Summary */}
               {data.aiSummary && (
                 <>
@@ -119,7 +182,7 @@ export function SafetyPanel({ data, loading, open, onClose }: Props) {
 
               {/* Data source note */}
               <div className="mt-4 text-white/30 text-xs">
-                Sources: NCRB 2022 + data.gov.in + crowd reports
+                Sources: NCRB 2018–2022 + crowd reports
               </div>
             </>
           )
