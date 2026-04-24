@@ -110,21 +110,22 @@ function perpendicularCandidates(
   return candidates
 }
 
-// Are two routes "too similar"? Compare bounding boxes and mid-point proximity.
+// Are two routes "too similar"?
+// Samples every 500m and checks maximum point-to-point deviation.
+// Routes are duplicates only if they never diverge by more than 500m.
 function routesAreSimilar(a: [number, number][], b: [number, number][]): boolean {
-  // Sample 5 points from each and check average distance
-  const sampleA = samplePolyline(a, Math.max(1, (a.length / 5)))
-  const sampleB = samplePolyline(b, Math.max(1, (b.length / 5)))
-  const minLen = Math.min(sampleA.length, sampleB.length, 5)
+  const sampleA = samplePolyline(a, 0.5)  // sample every 500m
+  const sampleB = samplePolyline(b, 0.5)
+  const minLen = Math.min(sampleA.length, sampleB.length)
   if (minLen < 2) return false
-  let totalDist = 0
+  let maxDist = 0
   for (let i = 0; i < minLen; i++) {
     const [lngA, latA] = sampleA[i]
     const [lngB, latB] = sampleB[i]
-    totalDist += haversineKm(latA, lngA, latB, lngB)
+    maxDist = Math.max(maxDist, haversineKm(latA, lngA, latB, lngB))
   }
-  // If routes are on average less than 300m apart at sampled points → similar
-  return (totalDist / minLen) < 0.3
+  // Only deduplicate near-identical routes (max divergence < 500m)
+  return maxDist < 0.5
 }
 
 // ── Supabase helpers ─────────────────────────────────────────────────────────
@@ -270,11 +271,11 @@ async function computeRoutes(
   const detourRoutes: OsrmRoute[] = []
 
   if (directKm >= 2) {
-    // Score candidate waypoints in parallel to find the safest intermediate points
-    const maxOffsetKm = Math.min(8, directKm * 0.4)
+    // Cap offset at 2.5 km to stay on land in coastal/peninsula cities (Mumbai, Chennai…)
+    const maxOffsetKm = Math.min(2.5, directKm * 0.25)
     const candidates = perpendicularCandidates(fromLat, fromLng, toLat, toLng, maxOffsetKm)
 
-    // Score each candidate waypoint's safety (quick 2km radius check)
+    // Score each candidate waypoint for safety
     const candidateScores = await Promise.all(
       candidates.map(async (c) => {
         const crimes = await fetchCrimesNear(supabase, c.lat, c.lng, 2)
@@ -283,36 +284,29 @@ async function computeRoutes(
       })
     )
 
-    // Group by side (left / right) and take the best from each group
+    // Pick the safest candidate from each side (left / right of route)
     const leftCandidates  = candidateScores.filter(c => c.position.includes('left'))
     const rightCandidates = candidateScores.filter(c => c.position.includes('right'))
 
     const bestLeft  = leftCandidates.sort((a, b) => b.safetyScore - a.safetyScore)[0]
     const bestRight = rightCandidates.sort((a, b) => b.safetyScore - a.safetyScore)[0]
 
-    // Only build a detour if the waypoint is meaningfully safer than the direct midpoint
-    const directMidCrimes = await fetchCrimesNear(
-      supabase,
-      (fromLat + toLat) / 2,
-      (fromLng + toLng) / 2,
-      2
-    )
-    const directMidScore = computeSafetyScore(directMidCrimes, [], 2, hour).score
-
+    // Always attempt detours — even a same-score path gives the user a different route option.
+    // In uniformly high-crime areas, comparing scores would always block detour generation.
     for (const best of [bestLeft, bestRight]) {
-      if (!best || best.safetyScore <= directMidScore + 0.5) continue  // not meaningfully safer
+      if (!best) continue
       try {
         const detourResult = await fetchOsrmRoutes(fromLng, fromLat, toLng, toLat, best.lng, best.lat)
         if (detourResult[0]) {
           const detour = detourResult[0]
-          // Reject if detour is more than 60% longer than the direct route
+          // Reject only if detour is more than 70% longer than the direct route
           const detourKm = detour.distance / 1000
-          if (detourKm <= directKm * 1.6) {
+          if (detourKm <= directKm * 1.7) {
             detourRoutes.push(detour)
           }
         }
       } catch {
-        // ignore individual detour failures
+        // ignore individual detour failures (e.g. waypoint landed in water)
       }
     }
   }
