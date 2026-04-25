@@ -76,12 +76,11 @@ function perpendicularCandidates(
 
   const candidates: Array<{ lat: number; lng: number; position: string }> = []
 
-  // Offsets: 20%, 33%, 50% of direct distance, on both sides
-  const offsets = [
-    Math.min(maxOffsetKm, directKm * 0.20),
-    Math.min(maxOffsetKm, directKm * 0.33),
-    Math.min(maxOffsetKm, directKm * 0.50),
-  ].filter(o => o >= 0.5) // at least 500m offset to be meaningful
+  // Offsets: 20%, 33%, 50% of direct distance, on both sides.
+  // Deduplicate after capping so coastal/short routes don't produce identical waypoints.
+  const rawOffsets = [directKm * 0.20, directKm * 0.33, directKm * 0.50]
+    .map(o => Math.round(Math.min(maxOffsetKm, o) * 100) / 100)
+  const offsets = [...new Set(rawOffsets)].filter(o => o >= 0.5) // at least 500m offset to be meaningful
 
   // Positions along the route: 25%, 50%, 75%
   const positions = [0.25, 0.50, 0.75]
@@ -111,21 +110,27 @@ function perpendicularCandidates(
 }
 
 // Are two routes "too similar"?
-// Samples every 500m and checks maximum point-to-point deviation.
-// Routes are duplicates only if they never diverge by more than 500m.
+// Uses one-sided Hausdorff distance: for each sample point in A, find the
+// nearest point in B. If the MAXIMUM of those nearest distances is < 800m,
+// the routes are considered duplicates.
+// This correctly handles routes of different lengths (index-matching fails there).
 function routesAreSimilar(a: [number, number][], b: [number, number][]): boolean {
-  const sampleA = samplePolyline(a, 0.5)  // sample every 500m
+  const sampleA = samplePolyline(a, 0.5)
   const sampleB = samplePolyline(b, 0.5)
-  const minLen = Math.min(sampleA.length, sampleB.length)
-  if (minLen < 2) return false
-  let maxDist = 0
-  for (let i = 0; i < minLen; i++) {
-    const [lngA, latA] = sampleA[i]
-    const [lngB, latB] = sampleB[i]
-    maxDist = Math.max(maxDist, haversineKm(latA, lngA, latB, lngB))
+  if (sampleA.length < 2 || sampleB.length < 2) return false
+
+  let maxMinDist = 0
+  for (const [lngA, latA] of sampleA) {
+    // nearest point in B to this point in A
+    let minDist = Infinity
+    for (const [lngB, latB] of sampleB) {
+      const d = haversineKm(latA, lngA, latB, lngB)
+      if (d < minDist) minDist = d
+    }
+    if (minDist > maxMinDist) maxMinDist = minDist
   }
-  // Only deduplicate near-identical routes (max divergence < 500m)
-  return maxDist < 0.5
+  // Routes are duplicates only if A never strays more than 800m from B
+  return maxMinDist < 0.8
 }
 
 // ── Supabase helpers ─────────────────────────────────────────────────────────
@@ -266,6 +271,12 @@ async function computeRoutes(
     return NextResponse.json({ error: 'No route found between these points' }, { status: 404 })
   }
 
+  // Use the actual OSRM distance as the detour baseline, not haversine.
+  // Urban road distances are typically 20-40% longer than straight-line, so using
+  // haversine would make the 70% cap hit way too early (e.g. 9km haversine → 15.3km
+  // cap, but the actual fastest route is 11km making the effective cap only 39% longer).
+  const fastestRouteKm = osrmRoutes[0].distance / 1000
+
   // ── Step 2: Generate safety-optimised detour routes ──────────────────────
   // Only generate detours for trips > 2 km (short trips have no room for detours)
   const detourRoutes: OsrmRoute[] = []
@@ -284,31 +295,40 @@ async function computeRoutes(
       })
     )
 
-    // Pick the safest candidate from each side (left / right of route)
-    const leftCandidates  = candidateScores.filter(c => c.position.includes('left'))
-    const rightCandidates = candidateScores.filter(c => c.position.includes('right'))
+    // Pick the safest candidate from each (position × side) group.
+    // This guarantees geographic diversity across early/mid/late × left/right
+    // so we get routes that genuinely diverge — critical for Indian cities
+    // where OSRM returns only 1 native alternative and city-level crime scores
+    // are uniform (sort by score alone would pick clustered candidates).
+    const groups = new Map<string, typeof candidateScores[0]>()
+    for (const c of candidateScores) {
+      const side = c.position.includes('left') ? 'left' : 'right'
+      const pos  = c.position.split('-')[0]   // 'early' | 'mid' | 'late'
+      const key  = `${pos}-${side}`
+      const existing = groups.get(key)
+      if (!existing || c.safetyScore > existing.safetyScore) groups.set(key, c)
+    }
+    const diverseCandidates = Array.from(groups.values())
+    console.log('[route-safety] candidates:', candidates.length, '| groups:', diverseCandidates.length, '| directKm:', directKm.toFixed(1), '| maxOffsetKm:', maxOffsetKm.toFixed(2))
 
-    const bestLeft  = leftCandidates.sort((a, b) => b.safetyScore - a.safetyScore)[0]
-    const bestRight = rightCandidates.sort((a, b) => b.safetyScore - a.safetyScore)[0]
-
-    // Always attempt detours — even a same-score path gives the user a different route option.
-    // In uniformly high-crime areas, comparing scores would always block detour generation.
-    for (const best of [bestLeft, bestRight]) {
-      if (!best) continue
+    // Route through each candidate sequentially to avoid hammering OSRM
+    for (const candidate of diverseCandidates) {
       try {
-        const detourResult = await fetchOsrmRoutes(fromLng, fromLat, toLng, toLat, best.lng, best.lat)
+        const detourResult = await fetchOsrmRoutes(fromLng, fromLat, toLng, toLat, candidate.lng, candidate.lat)
         if (detourResult[0]) {
           const detour = detourResult[0]
-          // Reject only if detour is more than 70% longer than the direct route
           const detourKm = detour.distance / 1000
-          if (detourKm <= directKm * 1.7) {
+          console.log(`[route-safety] candidate ${candidate.position}: ${detourKm.toFixed(1)}km (limit ${(fastestRouteKm * 1.7).toFixed(1)}km) → ${detourKm <= fastestRouteKm * 1.7 ? 'kept' : 'rejected (too long)'}`)
+          // Reject only if detour is more than 70% longer than the fastest OSRM route
+          if (detourKm <= fastestRouteKm * 1.7) {
             detourRoutes.push(detour)
           }
         }
-      } catch {
-        // ignore individual detour failures (e.g. waypoint landed in water)
+      } catch (e) {
+        console.log(`[route-safety] candidate ${candidate.position}: OSRM error`, e)
       }
     }
+    console.log('[route-safety] detourRoutes:', detourRoutes.length)
   }
 
   // ── Step 3: Score all routes in parallel ─────────────────────────────────
@@ -337,10 +357,15 @@ async function computeRoutes(
   )
 
   // ── Step 4: Deduplicate similar routes ───────────────────────────────────
+  console.log('[route-safety] scored routes before dedup:', scored.length)
   const unique: RouteOption[] = []
   for (const route of scored) {
-    const isDuplicate = unique.some(u => routesAreSimilar(u.routeGeometry, route.routeGeometry))
-    if (!isDuplicate) unique.push(route)
+    const dupOf = unique.find(u => routesAreSimilar(u.routeGeometry, route.routeGeometry))
+    if (dupOf) {
+      console.log(`[route-safety] dedup: "${route.label}" (${route.distanceKm}km) ~ "${dupOf.label}" (${dupOf.distanceKm}km)`)
+    } else {
+      unique.push(route)
+    }
   }
 
   // ── Step 5: Sort by safety score descending, re-assign sequential IDs ────
